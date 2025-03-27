@@ -1,59 +1,100 @@
-# (C) Copyright Peter Hinch 2017-2019.
-# Released under the MIT licence.
+import network
+import ubinascii
+import machine
+import utime
+import json
+from umqtt.simple import MQTTClient
+import dht
 
-# This demo publishes to topic "result" and also subscribes to that topic.
-# This demonstrates bidirectional TLS communication.
-# You can also run the following on a PC to verify:
-# mosquitto_sub -h test.mosquitto.org -t result
-# To get mosquitto_sub to use a secure connection use this, offered by @gmrza:
-# mosquitto_sub -h <my local mosquitto server> -t result -u <username> -P <password> -p 8883
 
-# Public brokers https://github.com/mqtt/mqtt.github.io/wiki/public_brokers
+TOPIC = "belen/{}".format(ubinascii.hexlify(machine.unique_id()).decode())
 
-# red LED: ON == WiFi fail
-# green LED heartbeat: demonstrates scheduler is running.
+# Conectar a WiFi
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(SSID, PASSWORD)
+    while not wlan.isconnected():
+        print("Conectando a WiFi...")
+        utime.sleep(1)
+    print("Conectado a WiFi", wlan.ifconfig())
 
-from mqtt_as import MQTTClient
-from mqtt_local import config
-import uasyncio as asyncio
+# Configuración MQTT
+client = MQTTClient("pico_client", BROKER)
 
-SERVER = config['server']
+# Sensores y actuadores
+d = dht.DHT22(machine.Pin(13))  # Sensor DHT22
+led = machine.Pin(27, machine.Pin.OUT)
+rele = machine.Pin(12, machine.Pin.OUT)
 
-def sub_cb(topic, msg, retained):
-    c, r = [int(x) for x in msg.decode().split(' ')]
-    print('Topic = {} Count = {} Retransmissions = {} Retained = {}'.format(topic.decode(), c, r, retained))
+# Estado inicial
+parametros = {
+    "temperatura": 0.0,
+    "humedad": 0.0,
+    "setpoint": 26.5,
+    "periodo": 10,
+    "modo": "auto",
+    "rele": "OFF"
+}
 
-async def wifi_han(state):
-    print('Wifi is ', 'up' if state else 'down')
-    await asyncio.sleep(1)
+def sub_cb(topic, msg):
+    global parametros
+    topic = topic.decode()
+    msg = msg.decode()
+    print(f"Recibido -> {topic}: {msg}")
+    
+    if topic == "setpoint":
+        try:
+            parametros['setpoint'] = float(msg)
+        except ValueError:
+            print("ERROR: setpoint debe ser flotante")
+    elif topic == "periodo":
+        try:
+            parametros['periodo'] = float(msg)
+        except ValueError:
+            print("ERROR: periodo debe ser flotante")
+    elif topic == "modo":
+        if msg in ["auto", "manual"]:
+            parametros['modo'] = msg
+        else:
+            print("ERROR: modo debe ser auto o manual")
+    elif topic == "rele" and parametros['modo'] == "manual":
+        if msg == "ON":
+            rele.value(0)
+        elif msg == "OFF":
+            rele.value(1)
+    client.publish(TOPIC, json.dumps(parametros))
 
-# If you connect with clean_session True, must re-subscribe (MQTT spec 3.1.2.4)
-async def conn_han(client):
-    await client.subscribe('result', 1)
-
-async def main(client):
-    await client.connect()
-    n = 0
-    await asyncio.sleep(2)  # Give broker time
+def monitoreo():
     while True:
-        print('publish', n)
-        # If WiFi is down the following will pause for the duration.
-        await client.publish('result', '{} {}'.format(n, client.REPUB_COUNT), qos = 1)
-        n += 1
-        await asyncio.sleep(10)  # Broker is slow
+        d.measure()
+        parametros["temperatura"] = d.temperature()
+        parametros["humedad"] = d.humidity()
+        
+        if parametros["modo"] == "auto":
+            if parametros["temperatura"] > parametros["setpoint"]:
+                rele.value(0)
+                parametros["rele"] = "ON"
+            else:
+                rele.value(1)
+                parametros["rele"] = "OFF"
+        
+        client.publish(TOPIC, json.dumps(parametros))
+        utime.sleep(parametros['periodo'])
 
-# Define configuration
-config['subs_cb'] = sub_cb
-config['server'] = SERVER
-config['connect_coro'] = conn_han
-config['wifi_coro'] = wifi_han
-config['ssl'] = True
+# Conectar WiFi y MQTT
+connect_wifi()
+client.set_callback(sub_cb)
+client.connect()
+client.subscribe("setpoint")
+client.subscribe("periodo")
+client.subscribe("modo")
+client.subscribe("rele")
 
-# Set up client
-MQTTClient.DEBUG = True  # Optional
-client = MQTTClient(config)
-try:
-    asyncio.run(main(client))
-finally:
-    client.close()
-    asyncio.new_event_loop()
+while True:
+    try:
+        client.check_msg()
+        monitoreo()
+    except Exception as e:
+        print("Error:", e)
+        utime.sleep(5)
