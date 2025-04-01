@@ -15,15 +15,9 @@ rele = machine.Pin(2, machine.Pin.OUT)  # Relé para controlar calefacción
 led = machine.Pin("LED", machine.Pin.OUT)  # LED indicador en la placa
 
 
-
-
 async def wifi_han(state):
     print('WiFi está', 'conectado' if state else 'desconectado')
     await asyncio.sleep(1)
-
-
-
-
 
 
 # Función para leer los parámetros desde config.json
@@ -32,7 +26,8 @@ def leer_parametros():
     try:
         with open("config.json", "r") as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"Error al leer config.json: {e}")
         return {"setpoint": 20, "periodo": 10, "modo": "auto", "rele": 0}
 
 # Cargar valores almacenados
@@ -47,32 +42,21 @@ rele_estado = config_data["rele"]
 def guardar_parametros():
     """Guarda los parámetros en un archivo JSON."""
     try:
-        # Crea el diccionario con los parámetros
         json_data = {"setpoint": setpoint, "periodo": periodo, "modo": modo, "rele": rele_estado}
-        
-        # Abre el archivo en modo escritura ('w')
         with open("config.json", "w") as f:
-            # Escribe el diccionario en formato JSON usando ujson
             json.dump(json_data, f)
         print("Parámetros guardados.")
-
     except Exception as e:
         print(f"Error al guardar parámetros: {e}")
-
-
-
 
 
 async def destellar_led():
     """Realiza el destello de los LED de forma asíncrona."""
     for _ in range(5):
         led.on()
-        await asyncio.sleep(0.5)  # Usar asyncio.sleep para no bloquear el ciclo de eventos
+        await asyncio.sleep(0.5)
         led.off()
         await asyncio.sleep(0.5)
-
-
-
 
 
 async def actualizar_rele(medir=True):
@@ -81,34 +65,27 @@ async def actualizar_rele(medir=True):
 
     if modo == "auto":
         if medir:
-            await asyncio.sleep(0)  # Permitir que otras tareas se ejecuten
+            await asyncio.sleep(0)
             sensor.measure()
-        
+
         temperatura = sensor.temperature()
 
         if temperatura > setpoint:
-            rele.value(0)  # Encender relé si temperatura es mayor al setpoint
+            rele.value(0)  # Apagar relé si temperatura es mayor al setpoint
         else:
-            rele.value(1)  # Apagar relé si la temperatura es menor o igual al setpoint
+            rele.value(1)  # Encender relé si la temperatura es menor o igual al setpoint
     else:
         rele.value(rele_estado)
 
 
-
-
-
-
-
-
 def manejar_mensajes(topic, msg, retained):
     """Maneja los mensajes recibidos por MQTT y actualiza los parámetros."""
-    
     print("Mensaje recibido")
 
     global setpoint, periodo, modo, rele_estado
     topic = topic.decode()
     msg = msg.decode()
-    
+
     if topic.endswith("/setpoint"):
         setpoint = int(msg)
     elif topic.endswith("/periodo"):
@@ -116,41 +93,47 @@ def manejar_mensajes(topic, msg, retained):
     elif topic.endswith("/modo"):
         modo = msg
     elif topic.endswith("/rele"):
-        # Alternar el estado del relé cuando se recibe "rele"
-        if msg.lower() == "rele":
-            rele_estado = 1 if rele_estado == 0 else 0  # Cambia entre 0 y 1
+        msg = msg.lower()
+        if msg in ["on", "1"]:
+            rele_estado = 0  # ENCENDER el relé (inverso)
+        elif msg in ["off", "0"]:
+            rele_estado = 1  # APAGAR el relé (inverso)
     elif topic.endswith("/destello") and msg == "destello":
-        # Llamamos a la función de destello sin bloquear el ciclo de eventos
         asyncio.create_task(destellar_led())  # Inicia el destello en una tarea separada
-    
+
     guardar_parametros()
     asyncio.create_task(actualizar_rele(True))  # Llamada asíncrona para evitar bloqueos
 
 
-
-
-
 async def publicar_datos(client):
-
-    await client.connect()
-    
     """Publica periódicamente los datos del sensor en MQTT."""
-    while True:
-        sensor.measure()
-        asyncio.create_task(actualizar_rele(False))  # Llamada asíncrona
+    try:
+        await client.connect()
+        print("Conectado a MQTT")
 
-        data = {
-            "temperatura": sensor.temperature(),
-            "humedad": sensor.humidity(),
-            "setpoint": setpoint,
-            "periodo": periodo,
-            "modo": modo
-        }
+        while True:
+            try:
+                sensor.measure()
+                asyncio.create_task(actualizar_rele(False))  # Llamada asíncrona
 
-        print(data)
+                data = {
+                    "temperatura": sensor.temperature(),
+                    "humedad": sensor.humidity(),
+                    "setpoint": setpoint,
+                    "periodo": periodo,
+                    "modo": modo
+                }
 
-        await client.publish(id_dispositivo, json.dumps(data), qos=1)
-        await asyncio.sleep(periodo)
+                print(f"Publicando datos: {data}")
+                await client.publish(id_dispositivo, json.dumps(data), qos=1)
+
+                await asyncio.sleep(periodo)
+            except Exception as e:
+                print(f"Error en publicación MQTT: {e}")
+                await asyncio.sleep(5)
+
+    except Exception as e:
+        print(f"Error de conexión MQTT: {e}")
 
 
 async def conexion_exitosa(client):
@@ -161,8 +144,6 @@ async def conexion_exitosa(client):
     await client.subscribe(f"{id_dispositivo}/rele", 1)
     await client.subscribe(f"{id_dispositivo}/destello", 1)
     print("Conexión MQTT exitosa")
-    
- 
 
 
 # Configuración de MQTT
@@ -176,8 +157,15 @@ config['ssl'] = True
 MQTTClient.DEBUG = True
 client = MQTTClient(config)
 
+
+async def main():
+    """Bucle principal de ejecución."""
+    await publicar_datos(client)
+
+
 try:
-    asyncio.run(publicar_datos(client))
+    asyncio.create_task(main())
+    asyncio.get_event_loop().run_forever()
 finally:
     client.close()
-    asyncio.new_event_loop()
+
